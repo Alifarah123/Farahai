@@ -3,11 +3,11 @@ package com.example.aiphotoedit
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
-import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -36,18 +36,11 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 
-const val DEFAULT_MODEL = "gemini-2.5-flash-image"
+const val DEFAULT_MODEL = "kontext"
 
-const val SYSTEM_PROMPT = """You are a professional photo editor. The user sends a photo and an editing instruction, usually in Persian (Farsi).
-Understand the Persian instruction precisely, then edit the provided photo accordingly and return the edited image.
-Rules:
-- Change ONLY what the user asks. Keep everything else identical: faces, identity, pose, clothing, lighting, composition and image proportions.
-- Keep the result photorealistic unless the user asks for a specific style (cartoon, painting, anime, etc.).
-- If the user asks to remove an object, fill the area naturally with matching background.
-- If the user asks to add text in Persian, write it in correct, readable Persian script, right-to-left, with connected letters.
-- Never add watermarks or extra text that was not requested.
-- If the request is unclear, make the most reasonable interpretation and still return an edited image."""
+const val TRANSLATE_SYSTEM = """Convert the user's Persian photo-editing instruction into one short, precise English instruction for an image editing model. Output only the English instruction, nothing else."""
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,9 +60,10 @@ fun App() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { ctx.getSharedPreferences("settings", Context.MODE_PRIVATE) }
-    var apiKey by remember { mutableStateOf(prefs.getString("key", "") ?: "") }
-    var model by remember { mutableStateOf(prefs.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL) }
-    var showSettings by remember { mutableStateOf(apiKey.isBlank()) }
+    var geminiKey by remember { mutableStateOf(prefs.getString("key", "") ?: "") }
+    var polKey by remember { mutableStateOf(prefs.getString("polkey", "") ?: "") }
+    var model by remember { mutableStateOf(prefs.getString("pmodel", DEFAULT_MODEL) ?: DEFAULT_MODEL) }
+    var showSettings by remember { mutableStateOf(polKey.isBlank()) }
 
     var original by remember { mutableStateOf<Bitmap?>(null) }
     var current by remember { mutableStateOf<Bitmap?>(null) }
@@ -100,11 +94,13 @@ fun App() {
         if (showSettings) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("کلید رایگان Gemini را از aistudio.google.com/apikey بگیرید و اینجا بچسبانید.")
-                    OutlinedTextField(apiKey, { apiKey = it.trim() }, label = { Text("API Key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(model, { model = it.trim() }, label = { Text("نام مدل") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("کلید Pollinations را از enter.pollinations.ai بگیرید (با حساب گیت‌هاب وارد شوید).")
+                    OutlinedTextField(polKey, { polKey = it.trim() }, label = { Text("کلید Pollinations") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(geminiKey, { geminiKey = it.trim() }, label = { Text("کلید Gemini (برای ترجمه دستور فارسی)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(model, { model = it.trim() }, label = { Text("نام مدل (kontext یا klein)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("توجه: برای ویرایش، عکس یک ساعت روی یک سرور موقت آپلود می‌شود.")
                     Button(onClick = {
-                        prefs.edit().putString("key", apiKey).putString("model", model).apply()
+                        prefs.edit().putString("key", geminiKey).putString("polkey", polKey).putString("pmodel", model).apply()
                         showSettings = false
                     }) { Text("ذخیره") }
                 }
@@ -136,19 +132,19 @@ fun App() {
                 enabled = !loading && instruction.isNotBlank() && !showOriginal,
                 modifier = Modifier.fillMaxWidth(),
                 onClick = {
-                    if (apiKey.isBlank()) { showSettings = true; error = "اول کلید API را وارد کنید"; return@Button }
+                    if (polKey.isBlank()) { showSettings = true; error = "اول کلید Pollinations را وارد کنید"; return@Button }
                     val src = current ?: return@Button
                     loading = true; error = null
                     scope.launch {
                         try {
-                            val out = withContext(Dispatchers.IO) { editWithGemini(src, instruction, apiKey, model) }
+                            val out = withContext(Dispatchers.IO) { editWithPollinations(src, instruction, polKey, geminiKey, model) }
                             history.add(src); current = out; instruction = ""
                         } catch (e: Exception) {
                             error = e.message ?: "خطای ناشناخته"
                         } finally { loading = false }
                     }
                 }
-            ) { Text(if (loading) "در حال ویرایش..." else "اعمال تغییر") }
+            ) { Text(if (loading) "در حال ویرایش (تا یک دقیقه)..." else "اعمال تغییر") }
 
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
 
@@ -183,51 +179,89 @@ fun loadBitmap(ctx: Context, uri: Uri, maxSide: Int = 1024): Bitmap {
     }
 }
 
-fun editWithGemini(bitmap: Bitmap, instruction: String, apiKey: String, model: String): Bitmap {
-    val baos = ByteArrayOutputStream()
-    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, baos)
-    val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+fun jpegBytes(bmp: Bitmap): ByteArray {
+    val b = ByteArrayOutputStream()
+    bmp.compress(Bitmap.CompressFormat.JPEG, 90, b)
+    return b.toByteArray()
+}
 
-    val body = JSONObject().apply {
-        put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT))))
-        put("contents", JSONArray().put(JSONObject().put("parts", JSONArray()
-            .put(JSONObject().put("text", instruction))
-            .put(JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", b64))))))
-        put("generationConfig", JSONObject().put("responseModalities", JSONArray().put("TEXT").put("IMAGE")))
-    }
+fun translateToEnglish(text: String, geminiKey: String): String {
+    if (geminiKey.isBlank()) return text
+    return try {
+        val body = JSONObject().apply {
+            put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", TRANSLATE_SYSTEM))))
+            put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text)))))
+        }
+        val conn = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent").openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 20000
+        conn.readTimeout = 40000
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("x-goog-api-key", geminiKey)
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+        if (conn.responseCode !in 200..299) {
+            text
+        } else {
+            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            val out = json.getJSONArray("candidates").getJSONObject(0).getJSONObject("content")
+                .getJSONArray("parts").getJSONObject(0).getString("text").trim()
+            if (out.isBlank()) text else out
+        }
+    } catch (e: Exception) { text }
+}
 
-    val conn = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent").openConnection() as HttpURLConnection
+fun uploadTemp(bytes: ByteArray): String {
+    val boundary = "----B" + System.currentTimeMillis()
+    val conn = URL("https://litterbox.catbox.moe/resources/internals/api.php").openConnection() as HttpURLConnection
     conn.requestMethod = "POST"
-    conn.connectTimeout = 30000
-    conn.readTimeout = 120000
     conn.doOutput = true
-    conn.setRequestProperty("Content-Type", "application/json")
-    conn.setRequestProperty("x-goog-api-key", apiKey)
-    conn.outputStream.use { it.write(body.toString().toByteArray()) }
-
+    conn.connectTimeout = 30000
+    conn.readTimeout = 60000
+    conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+    conn.outputStream.use { os ->
+        fun field(n: String, v: String) {
+            os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n".toByteArray())
+        }
+        field("reqtype", "fileupload")
+        field("time", "1h")
+        os.write("--$boundary\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
+        os.write(bytes)
+        os.write("\r\n--$boundary--\r\n".toByteArray())
+    }
     val code = conn.responseCode
-    val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+    val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }?.trim() ?: ""
+    if (code !in 200..299 || !text.startsWith("http")) throw Exception("آپلود موقت عکس ناموفق بود ($code). VPN را بررسی کنید.")
+    return text
+}
+
+fun editWithPollinations(bitmap: Bitmap, instruction: String, polKey: String, geminiKey: String, model: String): Bitmap {
+    val english = translateToEnglish(instruction, geminiKey)
+    val prompt = "$english. Keep the person's face, identity, pose and all other details unchanged."
+    val imageUrl = uploadTemp(jpegBytes(bitmap))
+    val url = "https://gen.pollinations.ai/image/" +
+        URLEncoder.encode(prompt, "UTF-8").replace("+", "%20") +
+        "?model=" + model +
+        "&image=" + URLEncoder.encode(imageUrl, "UTF-8") +
+        "&nologo=true&private=true" +
+        "&key=" + URLEncoder.encode(polKey, "UTF-8")
+
+    val conn = URL(url).openConnection() as HttpURLConnection
+    conn.connectTimeout = 30000
+    conn.readTimeout = 180000
+    val code = conn.responseCode
+    val data = (if (code in 200..299) conn.inputStream else conn.errorStream)?.readBytes() ?: ByteArray(0)
     if (code !in 200..299) {
+        val snippet = String(data).take(150)
         throw Exception(when (code) {
-            429 -> "سهمیه رایگان این مدل تمام شده یا مدل در پلن رایگان فعال نیست. کمی بعد دوباره امتحان کنید یا نام مدل را در تنظیمات عوض کنید."
-            400, 403 -> "کلید API یا نام مدل نامعتبر است ($code)"
-            else -> "خطای سرور ($code)"
+            401, 403 -> "کلید Pollinations نامعتبر است یا اجازه این مدل را ندارد ($code)"
+            402 -> "اعتبار رایگان هفتگی Pollinations تمام شده است"
+            429 -> "تعداد درخواست زیاد است. چند دقیقه بعد دوباره امتحان کنید"
+            else -> "خطا ($code): $snippet"
         })
     }
-
-    val json = JSONObject(text)
-    val parts = json.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts")
-    var reply = ""
-    if (parts != null) for (i in 0 until parts.length()) {
-        val p = parts.getJSONObject(i)
-        val inline = p.optJSONObject("inlineData") ?: p.optJSONObject("inline_data")
-        if (inline != null) {
-            val bytes = Base64.decode(inline.getString("data"), Base64.DEFAULT)
-            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
-        }
-        reply += p.optString("text", "")
-    }
-    throw Exception(if (reply.isNotBlank()) "مدل عکس برنگرداند: $reply" else "مدل عکسی برنگرداند (احتمالاً فیلتر ایمنی). دستور را تغییر دهید.")
+    return BitmapFactory.decodeByteArray(data, 0, data.size)
+        ?: throw Exception("پاسخ عکس نبود: " + String(data).take(150))
 }
 
 fun saveToGallery(ctx: Context, bmp: Bitmap): Boolean = try {
