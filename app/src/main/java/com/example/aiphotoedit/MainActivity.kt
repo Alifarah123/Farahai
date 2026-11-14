@@ -8,6 +8,7 @@ import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -36,7 +37,6 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 
 const val DEFAULT_MODEL = "kontext"
 
@@ -98,7 +98,7 @@ fun App() {
                     OutlinedTextField(polKey, { polKey = it.trim() }, label = { Text("کلید Pollinations") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(geminiKey, { geminiKey = it.trim() }, label = { Text("کلید Gemini (برای ترجمه دستور فارسی)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(model, { model = it.trim() }, label = { Text("نام مدل (kontext یا klein)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Text("توجه: برای ویرایش، عکس موقتاً روی یک سرور عمومی آپلود می‌شود.")
+                    Text("عکس مستقیم به Pollinations فرستاده می‌شود.")
                     Button(onClick = {
                         prefs.edit().putString("key", geminiKey).putString("polkey", polKey).putString("pmodel", model).apply()
                         showSettings = false
@@ -211,79 +211,93 @@ fun translateToEnglish(text: String, geminiKey: String): String {
     } catch (e: Exception) { text }
 }
 
-fun multipartUpload(endpoint: String, fieldName: String, extra: Map<String, String>, bytes: ByteArray): String {
-    val boundary = "----B" + System.currentTimeMillis()
-    val conn = URL(endpoint).openConnection() as HttpURLConnection
-    conn.requestMethod = "POST"
-    conn.doOutput = true
-    conn.connectTimeout = 15000
-    conn.readTimeout = 60000
-    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) AIPhotoEdit")
-    conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-    conn.outputStream.use { os ->
-        for ((k, v) in extra) {
-            os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$k\"\r\n\r\n$v\r\n".toByteArray())
-        }
-        os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$fieldName\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
-        os.write(bytes)
-        os.write("\r\n--$boundary--\r\n".toByteArray())
-    }
+class Resp(val code: Int, val type: String, val body: ByteArray)
+
+fun readResp(conn: HttpURLConnection): Resp {
     val code = conn.responseCode
-    val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }?.trim() ?: ""
-    if (code !in 200..299) throw Exception("HTTP $code")
-    return text
+    val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.readBytes() ?: ByteArray(0)
+    return Resp(code, conn.contentType ?: "", body)
 }
 
-fun uploadTemp(bytes: ByteArray): String {
-    val errors = StringBuilder()
-    try {
-        val t = multipartUpload("https://litterbox.catbox.moe/resources/internals/api.php", "fileToUpload", mapOf("reqtype" to "fileupload", "time" to "1h"), bytes)
-        if (t.startsWith("http")) return t
-    } catch (e: Exception) { errors.append("litterbox ") }
-    try {
-        val t = multipartUpload("https://tmpfiles.org/api/v1/upload", "file", emptyMap(), bytes)
-        val u = JSONObject(t).getJSONObject("data").getString("url")
-        return u.replace("http://", "https://").replace("tmpfiles.org/", "tmpfiles.org/dl/")
-    } catch (e: Exception) { errors.append("tmpfiles ") }
-    try {
-        val t = multipartUpload("https://uguu.se/upload", "files[]", emptyMap(), bytes)
-        val u = JSONObject(t).getJSONArray("files").getJSONObject(0).getString("url")
-        if (u.startsWith("http")) return u
-    } catch (e: Exception) { errors.append("uguu ") }
-    try {
-        val t = multipartUpload("https://0x0.st", "file", emptyMap(), bytes).trim()
-        if (t.startsWith("http")) return t
-    } catch (e: Exception) { errors.append("0x0 ") }
-    throw Exception("آپلود موقت عکس روی هیچ سروری ممکن نشد (" + errors.toString().trim() + "). VPN را عوض کنید.")
+fun postEdits(polKey: String, model: String, prompt: String, jpeg: ByteArray): Resp {
+    val boundary = "----B" + System.currentTimeMillis()
+    val conn = URL("https://gen.pollinations.ai/v1/images/edits").openConnection() as HttpURLConnection
+    conn.requestMethod = "POST"
+    conn.doOutput = true
+    conn.connectTimeout = 30000
+    conn.readTimeout = 180000
+    conn.setRequestProperty("Authorization", "Bearer $polKey")
+    conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+    conn.outputStream.use { os ->
+        fun field(n: String, v: String) {
+            os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n".toByteArray())
+        }
+        field("model", model)
+        field("prompt", prompt)
+        os.write("--$boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
+        os.write(jpeg)
+        os.write("\r\n--$boundary--\r\n".toByteArray())
+    }
+    return readResp(conn)
+}
+
+fun postGenerations(polKey: String, model: String, prompt: String, jpeg: ByteArray): Resp {
+    val dataUri = "data:image/jpeg;base64," + Base64.encodeToString(jpeg, Base64.NO_WRAP)
+    val body = JSONObject().put("model", model).put("prompt", prompt).put("n", 1)
+        .put("image", JSONArray().put(dataUri))
+    val conn = URL("https://gen.pollinations.ai/v1/images/generations").openConnection() as HttpURLConnection
+    conn.requestMethod = "POST"
+    conn.doOutput = true
+    conn.connectTimeout = 30000
+    conn.readTimeout = 180000
+    conn.setRequestProperty("Authorization", "Bearer $polKey")
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.outputStream.use { it.write(body.toString().toByteArray()) }
+    return readResp(conn)
+}
+
+fun decodeResp(r: Resp): Bitmap? {
+    if (r.code !in 200..299) return null
+    return try {
+        if (r.type.startsWith("image/")) {
+            BitmapFactory.decodeByteArray(r.body, 0, r.body.size)
+        } else {
+            val item = JSONObject(String(r.body)).getJSONArray("data").getJSONObject(0)
+            val b64 = item.optString("b64_json", "")
+            val u = item.optString("url", "")
+            if (b64.isNotBlank()) {
+                val bytes = Base64.decode(b64, Base64.DEFAULT)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } else if (u.isNotBlank()) {
+                val c = URL(u).openConnection() as HttpURLConnection
+                c.connectTimeout = 30000
+                c.readTimeout = 120000
+                val bytes = c.inputStream.readBytes()
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } else null
+        }
+    } catch (e: Exception) { null }
 }
 
 fun editWithPollinations(bitmap: Bitmap, instruction: String, polKey: String, geminiKey: String, model: String): Bitmap {
     val english = translateToEnglish(instruction, geminiKey)
     val prompt = "$english. Keep the person's face, identity, pose and all other details unchanged."
-    val imageUrl = uploadTemp(jpegBytes(bitmap))
-    val url = "https://gen.pollinations.ai/image/" +
-        URLEncoder.encode(prompt, "UTF-8").replace("+", "%20") +
-        "?model=" + model +
-        "&image=" + URLEncoder.encode(imageUrl, "UTF-8") +
-        "&nologo=true&private=true" +
-        "&key=" + URLEncoder.encode(polKey, "UTF-8")
+    val jpeg = jpegBytes(bitmap)
 
-    val conn = URL(url).openConnection() as HttpURLConnection
-    conn.connectTimeout = 30000
-    conn.readTimeout = 180000
-    val code = conn.responseCode
-    val data = (if (code in 200..299) conn.inputStream else conn.errorStream)?.readBytes() ?: ByteArray(0)
-    if (code !in 200..299) {
-        val snippet = String(data).take(150)
-        throw Exception(when (code) {
-            401, 403 -> "کلید Pollinations نامعتبر است یا اجازه این مدل را ندارد ($code)"
-            402 -> "اعتبار رایگان هفتگی Pollinations تمام شده است"
-            429 -> "تعداد درخواست زیاد است. چند دقیقه بعد دوباره امتحان کنید"
-            else -> "خطا ($code): $snippet"
-        })
-    }
-    return BitmapFactory.decodeByteArray(data, 0, data.size)
-        ?: throw Exception("پاسخ عکس نبود: " + String(data).take(150))
+    val r1 = try { postEdits(polKey, model, prompt, jpeg) } catch (e: Exception) { Resp(-1, "", (e.message ?: "").toByteArray()) }
+    decodeResp(r1)?.let { return it }
+
+    val r2 = try { postGenerations(polKey, model, prompt, jpeg) } catch (e: Exception) { Resp(-1, "", (e.message ?: "").toByteArray()) }
+    decodeResp(r2)?.let { return it }
+
+    val codes = listOf(r1.code, r2.code)
+    throw Exception(when {
+        codes.contains(402) -> "اعتبار رایگان هفتگی Pollinations تمام شده است"
+        codes.contains(401) || codes.contains(403) -> "کلید Pollinations نامعتبر است یا اجازه این مدل را ندارد"
+        codes.contains(429) -> "تعداد درخواست زیاد است. چند دقیقه بعد دوباره امتحان کنید"
+        else -> "ویرایش ناموفق. edits(" + r1.code + "): " + String(r1.body).take(120) +
+            " | generations(" + r2.code + "): " + String(r2.body).take(120)
+    })
 }
 
 fun saveToGallery(ctx: Context, bmp: Bitmap): Boolean = try {
