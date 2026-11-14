@@ -98,7 +98,7 @@ fun App() {
                     OutlinedTextField(polKey, { polKey = it.trim() }, label = { Text("کلید Pollinations") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(geminiKey, { geminiKey = it.trim() }, label = { Text("کلید Gemini (برای ترجمه دستور فارسی)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(model, { model = it.trim() }, label = { Text("نام مدل (kontext یا klein)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Text("توجه: برای ویرایش، عکس یک ساعت روی یک سرور موقت آپلود می‌شود.")
+                    Text("توجه: برای ویرایش، عکس موقتاً روی یک سرور عمومی آپلود می‌شود.")
                     Button(onClick = {
                         prefs.edit().putString("key", geminiKey).putString("polkey", polKey).putString("pmodel", model).apply()
                         showSettings = false
@@ -211,28 +211,50 @@ fun translateToEnglish(text: String, geminiKey: String): String {
     } catch (e: Exception) { text }
 }
 
-fun uploadTemp(bytes: ByteArray): String {
+fun multipartUpload(endpoint: String, fieldName: String, extra: Map<String, String>, bytes: ByteArray): String {
     val boundary = "----B" + System.currentTimeMillis()
-    val conn = URL("https://litterbox.catbox.moe/resources/internals/api.php").openConnection() as HttpURLConnection
+    val conn = URL(endpoint).openConnection() as HttpURLConnection
     conn.requestMethod = "POST"
     conn.doOutput = true
-    conn.connectTimeout = 30000
+    conn.connectTimeout = 15000
     conn.readTimeout = 60000
+    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) AIPhotoEdit")
     conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
     conn.outputStream.use { os ->
-        fun field(n: String, v: String) {
-            os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n".toByteArray())
+        for ((k, v) in extra) {
+            os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$k\"\r\n\r\n$v\r\n".toByteArray())
         }
-        field("reqtype", "fileupload")
-        field("time", "1h")
-        os.write("--$boundary\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
+        os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$fieldName\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
         os.write(bytes)
         os.write("\r\n--$boundary--\r\n".toByteArray())
     }
     val code = conn.responseCode
     val text = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() }?.trim() ?: ""
-    if (code !in 200..299 || !text.startsWith("http")) throw Exception("آپلود موقت عکس ناموفق بود ($code). VPN را بررسی کنید.")
+    if (code !in 200..299) throw Exception("HTTP $code")
     return text
+}
+
+fun uploadTemp(bytes: ByteArray): String {
+    val errors = StringBuilder()
+    try {
+        val t = multipartUpload("https://litterbox.catbox.moe/resources/internals/api.php", "fileToUpload", mapOf("reqtype" to "fileupload", "time" to "1h"), bytes)
+        if (t.startsWith("http")) return t
+    } catch (e: Exception) { errors.append("litterbox ") }
+    try {
+        val t = multipartUpload("https://tmpfiles.org/api/v1/upload", "file", emptyMap(), bytes)
+        val u = JSONObject(t).getJSONObject("data").getString("url")
+        return u.replace("http://", "https://").replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    } catch (e: Exception) { errors.append("tmpfiles ") }
+    try {
+        val t = multipartUpload("https://uguu.se/upload", "files[]", emptyMap(), bytes)
+        val u = JSONObject(t).getJSONArray("files").getJSONObject(0).getString("url")
+        if (u.startsWith("http")) return u
+    } catch (e: Exception) { errors.append("uguu ") }
+    try {
+        val t = multipartUpload("https://0x0.st", "file", emptyMap(), bytes).trim()
+        if (t.startsWith("http")) return t
+    } catch (e: Exception) { errors.append("0x0 ") }
+    throw Exception("آپلود موقت عکس روی هیچ سروری ممکن نشد (" + errors.toString().trim() + "). VPN را عوض کنید.")
 }
 
 fun editWithPollinations(bitmap: Bitmap, instruction: String, polKey: String, geminiKey: String, model: String): Bitmap {
